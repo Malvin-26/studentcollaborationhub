@@ -5,21 +5,33 @@ const MAX_FILE_SIZE_BYTES = 4 * 1024 * 1024;
 const SUPABASE_TABLE = process.env.SUPABASE_NOTES_TABLE || "notes";
 const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "notes-files";
 
-function getSupabaseClient() {
+function getSupabaseClientWithConfigError() {
   const url = process.env.SUPABASE_URL;
-  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY;
 
   if (!url || !serviceRoleKey) {
-    return null;
+    return {
+      client: null,
+      key: "",
+      isPublishableKey: false,
+      configError: "Supabase is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_SECRET_KEY)."
+    };
   }
 
-  if (!globalThis.__supabaseClient) {
+  if (!globalThis.__supabaseClient || globalThis.__supabaseClientKey !== serviceRoleKey || globalThis.__supabaseClientUrl !== url) {
     globalThis.__supabaseClient = createClient(url, serviceRoleKey, {
       auth: { autoRefreshToken: false, persistSession: false }
     });
+    globalThis.__supabaseClientKey = serviceRoleKey;
+    globalThis.__supabaseClientUrl = url;
   }
 
-  return globalThis.__supabaseClient;
+  return {
+    client: globalThis.__supabaseClient,
+    key: serviceRoleKey,
+    isPublishableKey: serviceRoleKey.startsWith("sb_publishable_"),
+    configError: null
+  };
 }
 
 function setCommonHeaders(res) {
@@ -118,11 +130,9 @@ function toPublicNote(note) {
 }
 
 async function listNotes(query, res) {
-  const supabase = getSupabaseClient();
+  const { client: supabase, configError } = getSupabaseClientWithConfigError();
   if (!supabase) {
-    return sendJson(res, 500, {
-      error: "Supabase is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY."
-    });
+    return sendJson(res, 500, { error: configError });
   }
 
   const search = normalizeText(query.search).toLowerCase();
@@ -167,11 +177,9 @@ async function readStorageFileAsBuffer(fileData) {
 }
 
 async function downloadNote(query, res) {
-  const supabase = getSupabaseClient();
+  const { client: supabase, configError } = getSupabaseClientWithConfigError();
   if (!supabase) {
-    return sendJson(res, 500, {
-      error: "Supabase is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY."
-    });
+    return sendJson(res, 500, { error: configError });
   }
 
   const id = Number(query.download);
@@ -225,11 +233,48 @@ function validateBase64Content(base64String) {
   }
 }
 
+async function uploadFileToStorage(supabase, filePath, fileBuffer, fileType) {
+  let uploadResult = await supabase.storage.from(SUPABASE_BUCKET).upload(filePath, fileBuffer, {
+    contentType: fileType,
+    upsert: false
+  });
+
+  if (!uploadResult.error) {
+    return uploadResult;
+  }
+
+  const uploadMessage = uploadResult.error.message || "";
+  const isBucketMissing =
+    /bucket/i.test(uploadMessage) &&
+    (/not found/i.test(uploadMessage) || /does not exist/i.test(uploadMessage));
+
+  if (!isBucketMissing) {
+    return uploadResult;
+  }
+
+  // Try to create the bucket (works only with a true server/service key).
+  const { error: bucketError } = await supabase.storage.createBucket(SUPABASE_BUCKET, { public: false });
+  if (bucketError && !/already exists/i.test(bucketError.message || "")) {
+    return uploadResult;
+  }
+
+  uploadResult = await supabase.storage.from(SUPABASE_BUCKET).upload(filePath, fileBuffer, {
+    contentType: fileType,
+    upsert: false
+  });
+  return uploadResult;
+}
+
 async function createNote(body, res) {
-  const supabase = getSupabaseClient();
+  const { client: supabase, configError, isPublishableKey } = getSupabaseClientWithConfigError();
   if (!supabase) {
+    return sendJson(res, 500, { error: configError });
+  }
+
+  if (isPublishableKey) {
     return sendJson(res, 500, {
-      error: "Supabase is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY."
+      error:
+        "SUPABASE_SERVICE_ROLE_KEY is set to a publishable key. Upload requires a server secret/service key (for example sb_secret_...)."
     });
   }
 
@@ -256,13 +301,25 @@ async function createNote(body, res) {
   const safeFileName = sanitizeFileName(fileName) || "upload.bin";
   const filePath = `${Date.now()}-${randomUUID()}-${safeFileName}`;
 
-  const { error: uploadError } = await supabase.storage.from(SUPABASE_BUCKET).upload(filePath, decodedFile, {
-    contentType: fileType,
-    upsert: false
-  });
+  const { error: uploadError } = await uploadFileToStorage(supabase, filePath, decodedFile, fileType);
 
   if (uploadError) {
     console.error("Supabase upload error:", uploadError.message);
+
+    const uploadMessage = uploadError.message || "";
+    if (/row-level security/i.test(uploadMessage)) {
+      return sendJson(res, 500, {
+        error:
+          "Supabase Storage denied upload (RLS). Use SUPABASE_SERVICE_ROLE_KEY with a server secret/service key and ensure bucket exists."
+      });
+    }
+
+    if (/bucket/i.test(uploadMessage) && (/not found/i.test(uploadMessage) || /does not exist/i.test(uploadMessage))) {
+      return sendJson(res, 500, {
+        error: `Supabase Storage bucket '${SUPABASE_BUCKET}' not found and could not be auto-created.`
+      });
+    }
+
     return sendJson(res, 500, { error: "Could not upload file to Supabase Storage" });
   }
 
